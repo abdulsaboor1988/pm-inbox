@@ -233,7 +233,7 @@ st.caption(f"Slack #product-requests-production  →  Jira {JIRA_PROJECT} · Pro
 # Filter tabs
 tab_all, tab_pending, tab_approved, tab_dismissed = st.tabs(["All", "Pending", "Approved", "Dismissed"])
 
-def render_messages(msgs, allow_actions=True):
+def render_messages(msgs, allow_actions=True, tab_key=""):
     if not msgs:
         st.info("No requests in this view.")
         return
@@ -285,7 +285,7 @@ def render_messages(msgs, allow_actions=True):
             if allow_actions and st.session_state.view == "pm" and status == "pending":
                 a_col, d_col, _ = st.columns([1, 1, 4])
                 with a_col:
-                    if st.button("✅ Approve", key=f"approve_{i}_{msg['id']}"):
+                    if st.button("✅ Approve", key=f"approve_{tab_key}_{i}_{msg['id']}"):
                         if not jira_token:
                             st.error("Enter Jira API token in sidebar first.")
                         else:
@@ -299,7 +299,7 @@ def render_messages(msgs, allow_actions=True):
                                 except Exception as e:
                                     st.error(f"Jira error: {e}")
                 with d_col:
-                    if st.button("✗ Dismiss", key=f"dismiss_{i}_{msg['id']}"):
+                    if st.button("✗ Dismiss", key=f"dismiss_{tab_key}_{i}_{msg['id']}"):
                         msg["status"] = "dismissed"
                         st.rerun()
 
@@ -307,13 +307,13 @@ def render_messages(msgs, allow_actions=True):
 
 
 with tab_all:
-    render_messages(st.session_state.messages)
+    render_messages(st.session_state.messages, tab_key="all")
 
 with tab_pending:
-    render_messages([m for m in st.session_state.messages if m["status"] == "pending"])
+    render_messages([m for m in st.session_state.messages if m["status"] == "pending"], tab_key="pending")
 
 with tab_approved:
-    render_messages([m for m in st.session_state.messages if m["status"] == "approved"], allow_actions=False)
+    render_messages([m for m in st.session_state.messages if m["status"] == "approved"], allow_actions=False, tab_key="approved")
 
 with tab_dismissed:
-    render_messages([m for m in st.session_state.messages if m["status"] == "dismissed"], allow_actions=False)
+    render_messages([m for m in st.session_state.messages if m["status"] == "dismissed"], allow_actions=False, tab_key="dismissed")
