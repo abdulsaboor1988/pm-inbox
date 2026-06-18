@@ -137,7 +137,9 @@ def initials(name):
     return "".join(p[0] for p in parts[:2]).upper()
 
 def resolve_slack_user(user_id: str, token: str) -> str:
-    """Resolve a Slack user ID to a display name, with caching."""
+    """Resolve a Slack user ID to a display name.
+    Requires users:read scope on the Slack bot token.
+    """
     if not user_id or not token:
         return user_id
     cache = st.session_state.user_cache
@@ -153,12 +155,24 @@ def resolve_slack_user(user_id: str, token: str) -> str:
         data = resp.json()
         if data.get("ok"):
             profile = data["user"].get("profile", {})
-            name = profile.get("real_name") or profile.get("display_name") or user_id
+            name = (
+                profile.get("real_name")
+                or profile.get("display_name")
+                or data["user"].get("name")
+                or user_id
+            )
             cache[user_id] = name
             return name
-    except:
-        pass
-    return user_id
+        # Specific error handling so we know what is wrong
+        err = data.get("error", "")
+        if err == "missing_scope":
+            result = "[users:read scope missing]"
+        else:
+            result = f"Slack user ({user_id[:8]}…)"
+        cache[user_id] = result
+        return result
+    except Exception:
+        return f"Slack user ({user_id[:8]}…)"
 
 def parse_slack_messages(raw, slack_token):
     out = []
