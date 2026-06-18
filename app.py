@@ -3,6 +3,7 @@ import requests
 import re
 from datetime import datetime, date
 from base64 import b64encode
+from utils import google_auth, gmail as gmail_api, calendar as calendar_api, ai_structurer
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -112,8 +113,8 @@ html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
 
 
 # ── Session state ──────────────────────────────────────────────────────────────
-for k, v in [("messages", []), ("page", "requests"), ("view", "pm"),
-              ("user_cache", {}), ("approving_id", None)]:
+for k, v in [("messages", []), ("capture_items", []), ("page", "requests"), ("view", "pm"),
+              ("user_cache", {}), ("approving_id", None), ("capture_processing", False)]:
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -300,7 +301,7 @@ with st.sidebar:
         <div><div class="hf-app-name">Production Tech</div><div class="hf-app-sub">PM Inbox</div></div>
     </div>""", unsafe_allow_html=True)
 
-    for page_id, icon, label in [("requests","📥","Requests"), ("configuration","⚙️","Configuration")]:
+    for page_id, icon, label in [("requests","📥","Requests"), ("capture","📨","Capture"), ("configuration","⚙️","Configuration")]:
         if st.button(f"{icon}  {label}", key=f"nav_{page_id}", use_container_width=True,
                      type="primary" if st.session_state.page == page_id else "secondary"):
             st.session_state.page = page_id
@@ -502,6 +503,40 @@ def page_configuration():
         for obj in STRATEGIC_OBJECTIVES[1:]:
             st.markdown(f"- {obj}")
 
+    with st.expander("🔗  Google (Gmail & Calendar)", expanded=True):
+        st.markdown(f"""
+        <div class="config-row"><span class="config-key">OAuth status</span><span class="config-val">{'✓ Connected as ' + st.session_state.get('google_user_email','') if google_auth.is_authenticated() else '✗ Not connected'}</span></div>
+        <div class="config-row"><span class="config-key">Scopes</span><span class="config-val">gmail.readonly · calendar.readonly</span></div>
+        """, unsafe_allow_html=True)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        g_client_id = st.text_input("Google Client ID", value=st.session_state.get("google_client_id",""), placeholder="….apps.googleusercontent.com", key="cfg_g_client_id")
+        g_client_secret = st.text_input("Google Client Secret", value=st.session_state.get("google_client_secret",""), type="password", placeholder="GOCSPX-…", key="cfg_g_secret")
+        g_redirect = st.text_input("Redirect URI", value=st.session_state.get("google_redirect_uri",""), placeholder="https://your-app.streamlit.app", key="cfg_g_redirect", help="Must match exactly what you set in Google Cloud Console")
+        col_save, col_auth, col_out = st.columns([1, 1, 1])
+        with col_save:
+            if st.button("Save Google credentials", key="save_google"):
+                st.session_state["google_client_id"]     = g_client_id
+                st.session_state["google_client_secret"] = g_client_secret
+                st.session_state["google_redirect_uri"]  = g_redirect
+                st.success("Saved. Now click Connect Google Account.")
+        with col_auth:
+            if google_auth.is_configured() and not google_auth.is_authenticated():
+                auth_url = google_auth.build_auth_url()
+                st.link_button("🔗 Connect Google Account", auth_url, type="primary")
+        with col_out:
+            if google_auth.is_authenticated():
+                if st.button("Sign out", key="google_signout"):
+                    google_auth.sign_out()
+                    st.rerun()
+        # Handle OAuth callback code in URL params
+        params = st.query_params
+        if "code" in params and not google_auth.is_authenticated():
+            with st.spinner("Completing Google sign-in…"):
+                if google_auth.exchange_code(params["code"]):
+                    st.query_params.clear()
+                    st.success(f"Connected as {st.session_state.get('google_user_email','')}")
+                    st.rerun()
+
     with st.expander("👥  Access & view mode", expanded=False):
         st.markdown("""
         <div class="config-row"><span class="config-key">SSO integration</span><span class="config-val">Planned — HF SSO</span></div>
@@ -514,8 +549,236 @@ def page_configuration():
         st.caption("When HF SSO is integrated, view mode will be set automatically based on the logged-in user's role.")
 
 
+# ── Page: Capture ──────────────────────────────────────────────────────────────
+def page_capture():
+    # Handle OAuth callback at top of every page render
+    params = st.query_params
+    if "code" in params and not google_auth.is_authenticated():
+        with st.spinner("Completing Google sign-in…"):
+            if google_auth.exchange_code(params["code"]):
+                st.query_params.clear()
+                st.rerun()
+
+    st.markdown('<p class="page-title">Capture</p>', unsafe_allow_html=True)
+    st.markdown('<p class="page-sub">Pull feature requests from Gmail and meeting notes — AI structures them for review</p>', unsafe_allow_html=True)
+    st.markdown("<div style='margin-bottom:1rem'></div>", unsafe_allow_html=True)
+
+    if not google_auth.is_authenticated():
+        st.info("Connect your Google account first — go to **Configuration → Google** to set up OAuth credentials and sign in.")
+        return
+
+    user_email = st.session_state.get("google_user_email", "")
+    st.markdown(f'<p style="font-size:13px;color:#888;margin-bottom:1rem">Connected as <b>{user_email}</b></p>', unsafe_allow_html=True)
+
+    tab_gmail, tab_calendar, tab_review = st.tabs([
+        f"📧 Gmail",
+        f"📅 Meeting notes",
+        f"📋 Review ({len([m for m in st.session_state.capture_items if m['status']=='pending'])} pending)",
+    ])
+
+    # ── Gmail tab ──
+    with tab_gmail:
+        st.markdown("**Fetch emails and extract action items**")
+        col_q, col_n = st.columns([3, 1])
+        with col_q:
+            gmail_query = st.text_input(
+                "Gmail search query",
+                value="subject:(feature OR request OR feedback OR improvement) newer_than:30d",
+                key="gmail_query",
+                help="Standard Gmail search syntax"
+            )
+        with col_n:
+            gmail_max = st.number_input("Max emails", min_value=1, max_value=50, value=10, key="gmail_max")
+
+        if st.button("📧 Fetch & structure emails", type="primary", key="fetch_gmail"):
+            token = google_auth.get_access_token()
+            if not token:
+                st.error("Not authenticated — please reconnect in Configuration.")
+            else:
+                with st.spinner("Fetching emails from Gmail…"):
+                    try:
+                        emails = gmail_api.fetch_emails(token, gmail_query, int(gmail_max))
+                        st.info(f"Fetched {len(emails)} emails — running AI extraction…")
+                        existing_ids = {m["id"] for m in st.session_state.capture_items}
+                        new_items = []
+                        progress = st.progress(0)
+                        for idx, email in enumerate(emails):
+                            progress.progress((idx + 1) / len(emails))
+                            ai_items = ai_structurer.structure_items(
+                                f"Subject: {email['subject']}\n\n{email['body']}",
+                                source_type="email"
+                            )
+                            for i, ai_item in enumerate(ai_items):
+                                item = ai_structurer.build_capture_item(email, ai_item, i)
+                                if item["id"] not in existing_ids:
+                                    new_items.append(item)
+                                    existing_ids.add(item["id"])
+                        progress.empty()
+                        st.session_state.capture_items = new_items + st.session_state.capture_items
+                        st.success(f"✓ Extracted {len(new_items)} action item(s) from {len(emails)} emails.")
+                    except Exception as e:
+                        st.error(f"Gmail error: {e}")
+
+    # ── Calendar tab ──
+    with tab_calendar:
+        st.markdown("**Fetch meeting notes and extract action items**")
+        col_d, _ = st.columns([1, 2])
+        with col_d:
+            days_back = st.number_input("Look back (days)", min_value=1, max_value=90, value=14, key="cal_days")
+
+        if st.button("📅 Fetch & structure meeting notes", type="primary", key="fetch_calendar"):
+            token = google_auth.get_access_token()
+            if not token:
+                st.error("Not authenticated — please reconnect in Configuration.")
+            else:
+                with st.spinner("Fetching meetings from Google Calendar…"):
+                    try:
+                        meetings = calendar_api.fetch_meetings(token, int(days_back))
+                        meetings_with_notes = [m for m in meetings if m.get("body")]
+                        st.info(f"Found {len(meetings_with_notes)} meetings with notes — running AI extraction…")
+                        existing_ids = {m["id"] for m in st.session_state.capture_items}
+                        new_items = []
+                        progress = st.progress(0)
+                        for idx, meeting in enumerate(meetings_with_notes):
+                            progress.progress((idx + 1) / max(len(meetings_with_notes), 1))
+                            content = f"Meeting: {meeting['subject']}\nDate: {meeting['date']}\n"
+                            if meeting.get("attendees"):
+                                content += f"Attendees: {', '.join(meeting['attendees'][:5])}\n"
+                            content += f"\nNotes:\n{meeting['body']}"
+                            ai_items = ai_structurer.structure_items(content, source_type="meeting")
+                            for i, ai_item in enumerate(ai_items):
+                                item = ai_structurer.build_capture_item(meeting, ai_item, i)
+                                if item["id"] not in existing_ids:
+                                    new_items.append(item)
+                                    existing_ids.add(item["id"])
+                        progress.empty()
+                        st.session_state.capture_items = new_items + st.session_state.capture_items
+                        st.success(f"✓ Extracted {len(new_items)} action item(s) from {len(meetings_with_notes)} meetings.")
+                    except Exception as e:
+                        st.error(f"Calendar error: {e}")
+
+    # ── Review tab ──
+    with tab_review:
+        items = st.session_state.capture_items
+        if not items:
+            st.markdown("<div style='padding:2rem;text-align:center;color:#aaa'>No captured items yet — fetch from Gmail or Calendar first.</div>", unsafe_allow_html=True)
+            return
+
+        pending   = [m for m in items if m["status"] == "pending"]
+        approved  = [m for m in items if m["status"] == "approved"]
+        dismissed = [m for m in items if m["status"] == "dismissed"]
+
+        st.markdown(f"""
+        <div class="stat-row">
+            <div class="stat-card"><div class="stat-label">Total captured</div><div class="stat-value">{len(items)}</div></div>
+            <div class="stat-card"><div class="stat-label">Pending review</div><div class="stat-value amber">{len(pending)}</div></div>
+            <div class="stat-card"><div class="stat-label">Approved</div><div class="stat-value green">{len(approved)}</div></div>
+            <div class="stat-card"><div class="stat-label">Dismissed</div><div class="stat-value">{len(dismissed)}</div></div>
+        </div>""", unsafe_allow_html=True)
+
+        rv_all, rv_pending, rv_approved, rv_dismissed = st.tabs([
+            f"All ({len(items)})", f"Pending ({len(pending)})",
+            f"Approved ({len(approved)})", f"Dismissed ({len(dismissed)})"
+        ])
+
+        def render_capture(msgs, tab_key, actions=True):
+            if not msgs:
+                st.markdown("<div style='padding:2rem;text-align:center;color:#aaa'>No items here.</div>", unsafe_allow_html=True)
+                return
+            for i, msg in enumerate(msgs):
+                s  = msg["status"]
+                tk = msg.get("ticket_key")
+                source_icon = "📧" if msg.get("source") == "gmail" else "📅"
+                ticket_html = f'<a class="ticket-link" href="https://{JIRA_DOMAIN}/browse/{tk}" target="_blank">🎫 {tk}</a>' if tk else ""
+                source_label = f'{source_icon} {msg.get("source_subject","")[:60]}' if msg.get("source_subject") else source_icon
+
+                meta_tags = ""
+                if s == "approved":
+                    tags = []
+                    if msg.get("quarter"):    tags.append(f'<span class="meta-tag">📅 <b>{msg["quarter"]}</b></span>')
+                    if msg.get("objective"):  tags.append(f'<span class="meta-tag">🎯 <b>{msg["objective"]}</b></span>')
+                    if tags:
+                        meta_tags = f'<div class="meta-tags">{"".join(tags)}</div>'
+
+                st.markdown(f"""
+                <div class="req-card {s}">
+                    <div class="req-title">{msg['title'] or 'Untitled'}</div>
+                    <div class="req-meta">{msg['author']} &nbsp;·&nbsp; {msg['time']} &nbsp;·&nbsp; <span style="color:#6b7280">{source_label}</span></div>
+                    <div class="field-grid">
+                        {'<div class="field-block"><div class="fl">Tool</div><div class="fv">' + msg['tool'] + '</div></div>' if msg.get('tool') else ''}
+                        {'<div class="field-block"><div class="fl">Problem</div><div class="fv">' + msg['description'] + '</div></div>' if msg.get('description') else ''}
+                        {'<div class="field-block full"><div class="fl">Business impact</div><div class="fv">' + msg['impact'] + '</div></div>' if msg.get('impact') else ''}
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+                        {status_badge(s)}{priority_badge(msg.get('priority',''))}{ticket_html}
+                    </div>
+                    {meta_tags}
+                </div>""", unsafe_allow_html=True)
+
+                cap_uid = f"cap_{tab_key}_{i}"
+                is_approving = st.session_state.approving_id == f"{msg['id']}_{tab_key}"
+
+                if actions and s == "pending":
+                    if not is_approving:
+                        a_col, d_col, _ = st.columns([1, 1, 5])
+                        with a_col:
+                            if st.button("✅ Approve", key=f"capp_{cap_uid}", type="primary"):
+                                st.session_state.approving_id = f"{msg['id']}_{tab_key}"
+                                st.rerun()
+                        with d_col:
+                            if st.button("✗ Dismiss", key=f"cdis_{cap_uid}"):
+                                msg["status"] = "dismissed"
+                                st.rerun()
+                    else:
+                        st.markdown('<div class="approve-panel"><div class="approve-panel-title">📋 Set ticket details before creating in Jira</div>', unsafe_allow_html=True)
+                        ec1, ec2 = st.columns(2)
+                        with ec1:
+                            quarter = st.selectbox("Quarter", QUARTERS, key=f"cq_{cap_uid}")
+                        with ec2:
+                            objective = st.selectbox("Strategic objective", STRATEGIC_OBJECTIVES, key=f"cobj_{cap_uid}")
+                        dc1, dc2 = st.columns(2)
+                        with dc1:
+                            start_date = st.date_input("Start date (optional)", value=None, key=f"csd_{cap_uid}")
+                        with dc2:
+                            end_date = st.date_input("End date / due date (optional)", value=None, key=f"ced_{cap_uid}")
+                        st.markdown("</div>", unsafe_allow_html=True)
+                        conf_col, cancel_col, _ = st.columns([1.2, 1, 4])
+                        with conf_col:
+                            if st.button("🎫 Create Jira ticket", key=f"cconfirm_{cap_uid}", type="primary"):
+                                jt = st.session_state.jira_token
+                                je = st.session_state.jira_email
+                                if not jt:
+                                    st.error("Add Jira token in Configuration first.")
+                                else:
+                                    msg["quarter"]   = quarter if quarter != "—" else None
+                                    msg["objective"] = objective if objective != "—" else None
+                                    msg["start_date"]= str(start_date) if start_date else None
+                                    msg["end_date"]  = str(end_date) if end_date else None
+                                    with st.spinner("Creating Jira ticket…"):
+                                        try:
+                                            key = create_jira(msg, je, jt)
+                                            msg["status"]     = "approved"
+                                            msg["ticket_key"] = key
+                                            st.session_state.approving_id = None
+                                            st.success(f"{key} created ✓")
+                                            st.rerun()
+                                        except Exception as e:
+                                            st.error(f"Jira error: {e}")
+                        with cancel_col:
+                            if st.button("Cancel", key=f"ccancel_{cap_uid}"):
+                                st.session_state.approving_id = None
+                                st.rerun()
+
+        with rv_all:       render_capture(items, "call")
+        with rv_pending:   render_capture(pending, "cpend")
+        with rv_approved:  render_capture(approved, "cappr", actions=False)
+        with rv_dismissed: render_capture(dismissed, "cdism", actions=False)
+
+
 # ── Router ─────────────────────────────────────────────────────────────────────
 if st.session_state.page == "requests":
     page_requests()
+elif st.session_state.page == "capture":
+    page_capture()
 elif st.session_state.page == "configuration":
     page_configuration()
